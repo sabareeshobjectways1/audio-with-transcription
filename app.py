@@ -36,8 +36,10 @@ if 'transcription_content' not in st.session_state:
 
 def get_json_download_link(data, filename="annotated_data.json"):
     """Generates a link to download the annotated JSON data."""
-    json_str = json.dumps(data, indent=4)
-    b64 = base64.b64encode(json_str.encode()).decode()
+    # FIX: Set ensure_ascii=False to prevent escaping special characters.
+    json_str = json.dumps(data, indent=4, ensure_ascii=False)
+    # FIX: Explicitly encode as 'utf-8' before base64 encoding.
+    b64 = base64.b64encode(json_str.encode('utf-8')).decode()
     return f'<a href="data:file/json;base64,{b64}" download="{filename}">Download JSON File</a>'
 
 def process_audio_for_player(audio_bytes: bytes):
@@ -101,7 +103,7 @@ def transcribe_audio_segment_with_gemini(full_audio_bytes, start_time, end_time,
 - Your analysis must be confined strictly to the content within this clip.
 
 **CRITICAL INSTRUCTIONS:**
-1.  **TRANSCRIBE ACCURATELY:** Listen carefully and transcribe the speech in its original language. If the speech is in Mandarin, use Mandarin characters.
+1.  **TRANSCRIBE ACCURATELY:** Listen carefully and transcribe the speech in its original language. If the speech is in Mandarin, use Mandarin characters. If the speech is in Spanish, use Spanish characters with appropriate accents (e.g., ñ, é, á).
 2.  **HANDLE NON-SPEECH:**
     - If there is no audible speech in the segment, your entire response MUST be the exact text: `[SILENCE]`
     - If there is only background noise, music, or non-speech sounds, your entire response MUST be the exact text: `[NOISE]`
@@ -243,7 +245,7 @@ def annotation_page():
     st.title("Step 2: Audio Annotation")
     st.markdown("---")
     
-    uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m_4a", "ogg", "flac", "webm"])
+    uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a", "ogg", "flac", "webm"])
 
     if uploaded_file:
         # CORRECTED LINE: Changed the condition to safely check for None
@@ -328,7 +330,9 @@ def annotation_page():
 
     if st.session_state.metadata and st.session_state.speakers:
         final_json = {"type": st.session_state.metadata['type'],"value": {"languages": [st.session_state.metadata['internalLanguageCode']],**st.session_state.metadata,"speakers": st.session_state.speakers,"segments": st.session_state.segments,"taskStatus": {"segmentation": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"},"speakerId": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"},"transcription": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"}}}}
-        st.subheader("Live JSON Editor"); edited_json_string = st.text_area("JSON Data", json.dumps(final_json, indent=4), height=600, key="json_editor")
+        st.subheader("Live JSON Editor")
+        # FIX: Set ensure_ascii=False to display special characters correctly in the text area.
+        edited_json_string = st.text_area("JSON Data", json.dumps(final_json, indent=4, ensure_ascii=False), height=600, key="json_editor")
         if st.button("Apply JSON Changes"):
             try:
                 edited_data = json.loads(edited_json_string); value_section = edited_data.get('value', {}); st.session_state.speakers = value_section.get('speakers', []); st.session_state.segments = value_section.get('segments', []); st.success("JSON changes applied!"); st.rerun()
