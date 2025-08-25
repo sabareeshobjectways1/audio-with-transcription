@@ -8,15 +8,17 @@ import io
 from pydub import AudioSegment
 
 # --- Page Configuration ---
-
 st.set_page_config(
     page_title="Audio Annotation Tool",
     page_icon="🎙️",
     layout="wide"
 )
 
-# --- Initialize Session State ---
+# --- App Constants ---
+# Files larger than this will be pre-processed for the player.
+LARGE_FILE_THRESHOLD_MB = 25
 
+# --- Initialize Session State ---
 if 'metadata' not in st.session_state:
     st.session_state.metadata = {}
 if 'speakers' not in st.session_state:
@@ -38,55 +40,83 @@ def get_json_download_link(data, filename="annotated_data.json"):
     b64 = base64.b64encode(json_str.encode()).decode()
     return f'<a href="data:file/json;base64,{b64}" download="{filename}">Download JSON File</a>'
 
+def process_audio_for_player(audio_bytes: bytes):
+    """
+    Optimizes large audio files for the wavesurfer.js player to prevent crashes.
+    Returns the processed audio bytes and the format.
+    """
+    file_size_mb = len(audio_bytes) / (1024 * 1024)
+    
+    if file_size_mb <= LARGE_FILE_THRESHOLD_MB:
+        st.info("Small audio file detected. Using original quality for player.")
+        try:
+            audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+            buf = io.BytesIO()
+            audio.export(buf, format="wav")
+            return buf.getvalue(), "wav"
+        except Exception:
+             return audio_bytes, "wav"
+    else:
+        st.warning(f"Large file detected ({file_size_mb:.1f} MB). Optimizing for player performance...")
+        with st.spinner("Creating a lightweight audio preview... (This may take a moment)"):
+            try:
+                audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                audio = audio.set_channels(1)
+                audio = audio.set_frame_rate(22050)
+                buf = io.BytesIO()
+                audio.export(buf, format="mp3", bitrate="64k")
+                st.success("Optimization complete! Player is now ready.")
+                return buf.getvalue(), "mp3"
+            except Exception as e:
+                st.error(f"Failed to optimize audio file. Error: {e}")
+                return None, None
+
+
 def transcribe_audio_segment_with_gemini(full_audio_bytes, start_time, end_time, api_key):
     """
-    Extracts the audio segment between start_time and end_time (in seconds) and sends only that segment to Gemini for transcription.
+    Extracts the audio segment from the ORIGINAL high-quality audio bytes.
     """
     try:
-        # pydub can often auto-detect the format from the bytes
         audio = AudioSegment.from_file(io.BytesIO(full_audio_bytes))
-        # Gemini expects wav, so we will export as wav regardless of input format
-        mime_type = "audio/wav"
-
-        # Convert start/end to milliseconds
+        
         start_ms = int(float(start_time) * 1000)
         end_ms = int(float(end_time) * 1000)
         segment = audio[start_ms:end_ms]
 
-        # Export segment to WAV in memory
         buf = io.BytesIO()
         segment.export(buf, format="wav")
         segment_bytes = buf.getvalue()
         audio_base64 = base64.b64encode(segment_bytes).decode()
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
-        headers = {
-            'Content-Type': 'application/json'
-        }
+        headers = {'Content-Type': 'application/json'}
 
         duration = end_time - start_time
-        prompt = f"""You are an expert audio transcriptionist. Your task is to process an audio file and transcribe ONLY a specific time segment.\n\nIMPORTANT INSTRUCTIONS:\n1.  Analyze ONLY the audio content from 0.000 seconds to {duration:.3f} seconds.\n2.  The duration of the target segment is {duration:.3f} seconds.\n3.  You MUST IGNORE all audio content before 0.000 seconds and after {duration:.3f} seconds.\n4.  Focus exclusively on the specified time range: 0.000s - {duration:.3f}s.\n5.  Automatically detect the language spoken *within that specific segment*.\n6.  Provide a highly accurate transcription of ONLY that time segment.\n7.  If there is no audible speech in that specific time range, you MUST respond with the exact text \"[SILENCE]\".\n8.  If there is only background noise, music, or non-speech sounds in that segment, you MUST respond with the exact text \"[NOISE]\".\n9.  Return ONLY the final transcribed text from the specified segment. Do not include any commentary, timestamps, or introductory phrases like \"Here is the transcription:\".\n"""
+        
+        prompt = f"""You are a strict, expert audio transcription AI. Your single task is to transcribe the provided audio segment with perfect accuracy.
 
+**CONTEXT:**
+- You are processing a short audio clip sliced from a longer recording.
+- The provided audio clip's duration is {duration:.3f} seconds.
+- Your analysis must be confined strictly to the content within this clip.
+
+**CRITICAL INSTRUCTIONS:**
+1.  **TRANSCRIBE ACCURATELY:** Listen carefully and transcribe the speech in its original language. If the speech is in Mandarin, use Mandarin characters.
+2.  **HANDLE NON-SPEECH:**
+    - If there is no audible speech in the segment, your entire response MUST be the exact text: `[SILENCE]`
+    - If there is only background noise, music, or non-speech sounds, your entire response MUST be the exact text: `[NOISE]`
+3.  **OUTPUT FORMAT IS NON-NEGOTIABLE:**
+    - Your response MUST contain ONLY the transcribed text.
+    - DO NOT include any extra words, explanations, translations, notes, or introductory phrases like "Here is the transcription:".
+    - DO NOT add quotation marks around the transcription unless they were actually spoken.
+    - Your entire output will be the raw transcribed text and nothing else.
+
+Transcribe the audio now.
+"""
+        
         payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": audio_base64
-                            }
-                        }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2000,
-                "topP": 0.8,
-                "topK": 40
-            }
+            "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "audio/wav", "data": audio_base64}}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2000, "topP": 0.8, "topK": 40}
         }
 
         with st.spinner(f"Requesting transcription for segment {start_time}s - {end_time}s..."):
@@ -94,40 +124,25 @@ def transcribe_audio_segment_with_gemini(full_audio_bytes, start_time, end_time,
 
         if response.status_code == 200:
             result = response.json()
-            if not result.get('candidates'):
-                st.error(f"Gemini API Error: No candidates returned. Response: {result}")
-                return None
-            content = result['candidates'][0].get('content', {})
-            parts = content.get('parts', [])
+            parts = result.get('candidates', [{}])[0].get('content', {}).get('parts', [])
             if parts:
-                transcription = parts[0].get('text', '').strip()
-                return transcription
+                return parts[0].get('text', '').strip()
             return "[NO_CONTENT]"
         else:
-            error_msg = f"Gemini API Error: {response.status_code}"
-            if response.text:
-                error_msg += f" - {response.text}"
-            st.error(error_msg)
+            st.error(f"Gemini API Error: {response.status_code} - {response.text}")
             return None
-
-    except requests.exceptions.Timeout:
-        st.error("Request timed out. The audio file might be too large or there could be network issues.")
-        return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Network error during transcription: {str(e)}")
-        return None
     except Exception as e:
         st.error(f"Error during transcription: {str(e)}")
         return None
 
 # =====================================================================================
-# CUSTOM AUDIO PLAYER COMPONENT (Unchanged)
+# CUSTOM AUDIO PLAYER COMPONENT (UPDATED)
 # =====================================================================================
 
-def audio_player_component(audio_bytes: bytes):
+def audio_player_component(audio_bytes: bytes, audio_format: str = "wav"):
     """
-    Creates a custom audio player component using wavesurfer.js that displays
-    the current time, allows click-to-seek, and has playback speed control.
+    Creates a custom audio player component using wavesurfer.js.
+    Now accepts an audio_format to build the correct data URI.
     """
     b64_audio = base64.b64encode(audio_bytes).decode()
     component_html = f"""
@@ -141,10 +156,8 @@ def audio_player_component(audio_bytes: bytes):
             <div style="display: flex; align-items: center; gap: 5px;">
                 <label for="playbackSpeed">Speed:</label>
                 <select id="playbackSpeed" style="border-radius: 5px; padding: 5px;">
-                    <option value="0.5">0.5x</option>
-                    <option value="1" selected>1.0x</option>
-                    <option value="1.5">1.5x</option>
-                    <option value="2">2.0x</option>
+                    <option value="0.5">0.5x</option><option value="1" selected>1.0x</option>
+                    <option value="1.5">1.5x</option><option value="2">2.0x</option>
                 </select>
             </div>
         </div>
@@ -152,41 +165,19 @@ def audio_player_component(audio_bytes: bytes):
     <script src="https://unpkg.com/wavesurfer.js"></script>
     <script>
         var wavesurfer = WaveSurfer.create({{
-            container: '#waveform',
-            waveColor: 'violet',
-            progressColor: 'purple',
-            barWidth: 2,
-            barRadius: 3,
-            height: 100,
-            barGap: 3,
-            responsive: true,
-            fillParent: true,
-            minPxPerSec: 1,
-            cursorWidth: 1,
-            cursorColor: 'purple'
+            container: '#waveform', waveColor: 'violet', progressColor: 'purple',
+            barWidth: 2, barRadius: 3, height: 100, barGap: 3,
+            responsive: true, fillParent: true, minPxPerSec: 1,
+            cursorWidth: 1, cursorColor: 'purple'
         }});
-        wavesurfer.load('data:audio/wav;base64,{b64_audio}');
-
+        wavesurfer.load('data:audio/{audio_format};base64,{b64_audio}');
         const playBtn = document.getElementById('playBtn');
         const timeDisplay = document.getElementById('time-display');
         const speedSelector = document.getElementById('playbackSpeed');
-
         playBtn.onclick = function() {{ wavesurfer.playPause(); }};
-
-        wavesurfer.on('audioprocess', function() {{
-            let currentTime = wavesurfer.getCurrentTime();
-            timeDisplay.textContent = currentTime.toFixed(3);
-        }});
-        
-        wavesurfer.on('interaction', function() {{
-            let currentTime = wavesurfer.getCurrentTime();
-            timeDisplay.textContent = currentTime.toFixed(3);
-        }});
-
-        speedSelector.onchange = function() {{
-            wavesurfer.setPlaybackRate(this.value);
-        }};
-        
+        wavesurfer.on('audioprocess', function() {{ timeDisplay.textContent = wavesurfer.getCurrentTime().toFixed(3); }});
+        wavesurfer.on('interaction', function() {{ timeDisplay.textContent = wavesurfer.getCurrentTime().toFixed(3); }});
+        speedSelector.onchange = function() {{ wavesurfer.setPlaybackRate(this.value); }};
         wavesurfer.on('finish', function () {{ playBtn.textContent = 'Play'; }});
         wavesurfer.on('play', function () {{ playBtn.textContent = 'Pause'; }});
         wavesurfer.on('pause', function () {{ playBtn.textContent = 'Play'; }});
@@ -197,7 +188,6 @@ def audio_player_component(audio_bytes: bytes):
 # =====================================================================================
 # PAGE 1: METADATA INPUT FORM (Unchanged)
 # =====================================================================================
-
 def metadata_form():
     st.title("Step 1: Input Metadata")
     st.markdown("---")
@@ -213,18 +203,15 @@ def metadata_form():
         st.subheader("4. Domain")
         domain_name = st.text_input("Domain Name", "Call-center")
         topic_list = st.text_input("Topic List (comma-separated)", "Banking")
-        
         st.subheader("5. Annotator Info")
         login_encrypted = st.text_input("Login Encrypted (Optional)", "")
         annotator_id = st.text_input("Annotator ID", "t5fb5aa2")
-
         st.subheader("6. Convention Info")
         master_convention = st.text_input("Master Convention Name", "awsTranscriptionGuidelines_en_US_3.1")
         custom_addendum = st.text_input("Custom Addendum (Optional)", "en_NZ_1.0")
         st.subheader("7. Speaker Details")
         speakers_input = []
         speaker_dominant_varieties_data = []
-
         for i in range(int(head_count)):
             st.markdown(f"**Speaker {i+1}**")
             speaker_id = st.text_input(f"Speaker ID (leave blank for auto)", key=f"speaker_id_{i}")
@@ -234,262 +221,123 @@ def metadata_form():
             speaker_nativity_source = st.text_input(f"Speaker Nativity Source", "Annotator", key=f"nativity_source_{i}")
             speaker_role = st.text_input(f"Speaker Role", "Customer", key=f"role_{i}")
             speaker_role_source = st.text_input(f"Speaker Role Source", "Annotator", key=f"role_source_{i}")
-            
             st.markdown(f"*Speaker Language Info*")
             language_locale = st.text_input(f"Language Locale", lang_short, key=f"lang_locale_{i}")
             language_variety = st.text_input(f"Language Variety (comma-separated)", key=f"lang_variety_{i}")
             other_language_influence = st.text_input(f"Other Language Influence (comma-separated)", key=f"other_lang_influence_{i}")
-            
-            speakers_input.append({
-                "speakerId": speaker_id if speaker_id else str(uuid.uuid4()),
-                "gender": gender, "genderSource": gender_source, "speakerNativity": speaker_nativity,
-                "speakerNativitySource": speaker_nativity_source, "speakerRole": speaker_role,
-                "speakerRoleSource": speaker_role_source,
-                "languages": [language_locale]
-            })
-
+            speakers_input.append({"speakerId": speaker_id if speaker_id else str(uuid.uuid4()),"gender": gender,"genderSource": gender_source,"speakerNativity": speaker_nativity,"speakerNativitySource": speaker_nativity_source,"speakerRole": speaker_role,"speakerRoleSource": speaker_role_source,"languages": [language_locale]})
             if i == 0:
-                 speaker_dominant_varieties_data.append({
-                     "languageLocale": language_locale, 
-                     "languageVariety": [v.strip() for v in language_variety.split(",") if v.strip()], 
-                     "otherLanguageInfluence": [v.strip() for v in other_language_influence.split(",") if v.strip()]
-                 })
-            
-        submit_button = st.form_submit_button(label="Save Metadata and Proceed to Annotation")
-        if submit_button:
-            st.session_state.metadata = {
-                "type": {"name": type_name, "version": type_version},
-                "languageInfo": {
-                    "spokenLanguages": [lang_full],
-                    "speakerDominantVarieties": speaker_dominant_varieties_data
-                },
-                "domainInfo": {"domainVersion": "1.0", "domainList": [{"domain": domain_name, "topicList": [t.strip() for t in topic_list.split(',')]}]},
-                "annotatorInfo": {"loginEncrypted": login_encrypted, "annotatorId": annotator_id},
-                "conventionInfo": {"masterConventionName": master_convention, "customAddendum": custom_addendum},
-                "internalLanguageCode": lang_short
-            }
+                 speaker_dominant_varieties_data.append({"languageLocale": language_locale,"languageVariety": [v.strip() for v in language_variety.split(",") if v.strip()],"otherLanguageInfluence": [v.strip() for v in other_language_influence.split(",") if v.strip()]})
+        if st.form_submit_button(label="Save Metadata and Proceed to Annotation"):
+            st.session_state.metadata = {"type": {"name": type_name, "version": type_version},"languageInfo": {"spokenLanguages": [lang_full], "speakerDominantVarieties": speaker_dominant_varieties_data},"domainInfo": {"domainVersion": "1.0", "domainList": [{"domain": domain_name, "topicList": [t.strip() for t in topic_list.split(',')]}]},"annotatorInfo": {"loginEncrypted": login_encrypted, "annotatorId": annotator_id},"conventionInfo": {"masterConventionName": master_convention, "customAddendum": custom_addendum},"internalLanguageCode": lang_short}
             st.session_state.speakers = speakers_input
             st.session_state.page_state = 'annotation'
-            st.success("Metadata saved successfully! Proceed to the annotation step below.")
+            st.success("Metadata saved successfully!")
             st.rerun()
 
 # =====================================================================================
-# PAGE 2: AUDIO ANNOTATION AND JSON EDITOR (UPDATED WITH AUDIO METRICS)
+# PAGE 2: AUDIO ANNOTATION (UPDATED WITH PRE-PROCESSING LOGIC)
 # =====================================================================================
 
 def annotation_page():
     st.title("Step 2: Audio Annotation")
-
-    st.markdown("""
-        <style>
-        div[data-testid="stElementContainer"]:has(iframe[title^="st.iframe"]) {
-            width: 100%;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
     st.markdown("---")
     
-    uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a", "ogg", "flac", "webm"])
+    uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m_4a", "ogg", "flac", "webm"])
 
     if uploaded_file:
+        # CORRECTED LINE: Changed the condition to safely check for None
         if st.session_state.current_audio is None or st.session_state.current_audio.get('name') != uploaded_file.name:
-            st.session_state.current_audio = {
-                'name': uploaded_file.name,
-                'bytes': uploaded_file.getvalue()
-            }
+            # Store the original, high-quality audio bytes in session state
+            st.session_state.current_audio = {'name': uploaded_file.name, 'bytes': uploaded_file.getvalue()}
+            # Process the audio to create a potentially smaller version for the player
+            player_bytes, player_format = process_audio_for_player(st.session_state.current_audio['bytes'])
+            st.session_state.current_audio['player_bytes'] = player_bytes
+            st.session_state.current_audio['player_format'] = player_format
 
-        audio_bytes = st.session_state.current_audio['bytes']
+        # Use the original bytes for analysis and properties
+        original_audio_bytes = st.session_state.current_audio['bytes']
+        
+        # Use the (potentially smaller) processed bytes for the player
+        player_audio_bytes = st.session_state.current_audio.get('player_bytes')
+        player_audio_format = st.session_state.current_audio.get('player_format')
 
-        # ================================================================== #
-        # ========= NEW: CALCULATE AND DISPLAY AUDIO METRICS HERE ========== #
-        # ================================================================== #
-        st.subheader("Audio File Properties")
+        st.subheader("Audio File Properties (from original file)")
         try:
-            audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
-            
-            # --- Calculate Metrics ---
-            duration_seconds = len(audio_segment) / 1000.0
-            peak_loudness_dbfs = audio_segment.max_dBFS
-            sample_rate_khz = audio_segment.frame_rate / 1000.0
-            channels = "Stereo" if audio_segment.channels >= 2 else "Mono"
-            
-            # --- Display Metrics in Columns ---
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric(label="Duration", value=f"{duration_seconds:.2f} s")
-            with col2:
-                st.metric(label="Peak Loudness", value=f"{peak_loudness_dbfs:.2f} dBFS")
-            with col3:
-                st.metric(label="Sample Rate", value=f"{sample_rate_khz:.1f} kHz")
-            with col4:
-                st.metric(label="Channels", value=channels)
-
+            audio_segment = AudioSegment.from_file(io.BytesIO(original_audio_bytes))
+            duration_seconds = len(audio_segment) / 1000.0; peak_loudness_dbfs = audio_segment.max_dBFS; sample_rate_khz = audio_segment.frame_rate / 1000.0; channels = "Stereo" if audio_segment.channels >= 2 else "Mono"
+            col1, col2, col3, col4 = st.columns(4); col1.metric(label="Duration", value=f"{duration_seconds:.2f} s"); col2.metric(label="Peak Loudness", value=f"{peak_loudness_dbfs:.2f} dBFS"); col3.metric(label="Sample Rate", value=f"{sample_rate_khz:.1f} kHz"); col4.metric(label="Channels", value=channels)
         except Exception as e:
-            st.error(f"Could not process audio file to get properties. Error: {e}")
-        # ================================================================== #
-        # ======================= END OF NEW SECTION ======================= #
-        # ================================================================== #
+            st.error(f"Could not read audio properties. Error: {e}")
 
         st.subheader("Audio Player")
-        audio_player_component(audio_bytes)
-
+        if player_audio_bytes and player_audio_format:
+            # Pass the optimized bytes and format to the player component
+            audio_player_component(player_audio_bytes, player_audio_format)
+        else:
+            st.error("Audio could not be processed for the player.")
+        
+        # --- The rest of the page uses original_audio_bytes for transcription ---
         st.subheader("Add a New Segment")
-        st.markdown("Use the player above to find start/end times, then enter the details below.")
-
         time_col1, time_col2, transcribe_col = st.columns([2, 2, 1])
-
-        with time_col1:
-            start_time = st.text_input("Start Time (seconds.milliseconds, e.g., 0.0)", "0.0", key="start_time_input")
-        with time_col2:
-            end_time = st.text_input("End Time (seconds.milliseconds, e.g., 14.711)", "5.000", key="end_time_input")
-
+        with time_col1: start_time = st.text_input("Start Time (s)", "0.0", key="start_time_input")
+        with time_col2: end_time = st.text_input("End Time (s)", "5.0", key="end_time_input")
         with transcribe_col:
             st.markdown("<br>", unsafe_allow_html=True)
-            transcribe_button = st.button("🎙️ Transcribe", help="Transcribe this audio segment using Gemini")
-
-        if transcribe_button:
-            try:
-                start_float = float(start_time)
-                end_float = float(end_time)
-
-                if start_float >= end_float:
-                    st.error("Start time must be less than end time!")
-                elif start_float < 0:
-                    st.error("Start time cannot be negative!")
-                else:
-                    try:
-                        api_key = st.secrets["GEMINI_API_KEY"]
-                    except (FileNotFoundError, KeyError):
-                        st.error("GEMINI_API_KEY not found. Please add it to your Streamlit secrets.")
-                        st.stop()
-                    
-                    transcription = transcribe_audio_segment_with_gemini(
-                        audio_bytes, start_float, end_float, api_key
-                    )
-
-                    if transcription is not None:
-                        if transcription == "[SILENCE]":
-                            st.info("No speech detected in the specified time segment.")
-                            st.session_state.transcription_content = ""
-                        elif transcription == "[NOISE]":
-                            st.info("Only background noise/music detected in the segment.")
-                            st.session_state.transcription_content = "[NOISE]"
-                        elif transcription == "[NO_CONTENT]":
-                             st.warning("No content was returned from the API for this segment.")
-                             st.session_state.transcription_content = ""
-                        else:
-                            st.session_state.transcription_content = transcription
-                            st.success(f"✅ Transcribed segment ({start_float}s - {end_float}s) successfully!")
-                        st.rerun()
+            if st.button("🎙️ Transcribe", help="Transcribe this audio segment"):
+                try:
+                    start_float, end_float = float(start_time), float(end_time)
+                    if not(start_float < end_float and start_float >= 0): st.error("Start time must be less than end time and not negative.")
                     else:
-                        pass 
-            except ValueError:
-                st.error("Please enter valid numeric values for start and end times")
-            except Exception as e:
-                st.error(f"An unexpected error occurred: {e}")
-
+                        api_key = st.secrets["GEMINI_API_KEY"]
+                        # Pass the ORIGINAL bytes for high-quality transcription
+                        transcription = transcribe_audio_segment_with_gemini(original_audio_bytes, start_float, end_float, api_key)
+                        if transcription is not None:
+                            if transcription in ["[SILENCE]", "[NOISE]", "[NO_CONTENT]"]: st.info(f"API response: {transcription}"); st.session_state.transcription_content = transcription if transcription == "[NOISE]" else ""
+                            else: st.session_state.transcription_content = transcription; st.success(f"✅ Transcribed segment ({start_float}s - {end_float}s) successfully!")
+                            st.rerun()
+                except (ValueError, KeyError) as e: st.error(f"Error: {e}")
+        
         with st.form(key="segment_form", clear_on_submit=True):
-            primary_type = st.selectbox("Primary Type", ["Speech", "Noise", "Music", "Silence"], index=0)
-            loudness_level = st.selectbox("Loudness Level", ["Normal", "Quiet", "Loud"], index=0)
-
-            transcription = st.text_area("Transcription Content", 
-                                       value=st.session_state.transcription_content, 
-                                       help="Use the 'Transcribe' button above to auto-fill this field")
-            
-            if st.session_state.speakers:
-                speaker_options = {s['speakerId']: f"Speaker {i+1} ({s.get('speakerRole', 'N/A')})" for i, s in enumerate(st.session_state.speakers)}
-                selected_speaker_id = st.selectbox("Speaker", options=list(speaker_options.keys()), format_func=lambda x: speaker_options[x])
-            else:
-                st.warning("No speakers defined. Please add speakers in the metadata step.")
-                selected_speaker_id = None
-
-            add_segment_button = st.form_submit_button("Add Segment")
-
-            if add_segment_button:
-                if selected_speaker_id is None:
-                    st.error("Cannot add segment. Please define at least one speaker in the metadata.")
-                else:
+            transcription = st.text_area("Transcription Content", value=st.session_state.transcription_content, help="Use the 'Transcribe' button to auto-fill this field")
+            c1, c2, c3 = st.columns(3)
+            with c1: primary_type = st.selectbox("Primary Type", ["Speech", "Noise", "Music", "Silence"])
+            with c2: loudness_level = st.selectbox("Loudness Level", ["Normal", "Quiet", "Loud"])
+            with c3:
+                if st.session_state.speakers: speaker_options = {s['speakerId']: f"Speaker {i+1} ({s.get('speakerRole', 'N/A')})" for i, s in enumerate(st.session_state.speakers)}; selected_speaker_id = st.selectbox("Speaker", options=list(speaker_options.keys()), format_func=lambda x: speaker_options[x])
+                else: st.warning("No speakers defined."); selected_speaker_id = None
+            if st.form_submit_button("Add Segment"):
+                if selected_speaker_id:
                     try:
-                        start_float = float(start_time)
-                        end_float = float(end_time)
-                        
-                        if start_float >= end_float:
-                            st.error("Start time must be less than end time!")
+                        start_float, end_float = float(start_time), float(end_time)
+                        if start_float >= end_float: st.error("Start time must be less than end time!")
                         else:
                             lang_code = st.session_state.metadata.get('internalLanguageCode', 'en_US')
-                            new_segment = {
-                                "start": start_float,
-                                "end": end_float,
-                                "segmentId": str(uuid.uuid4()),
-                                "primaryType": primary_type,
-                                "loudnessLevel": loudness_level,
-                                "language": lang_code,
-                                "segmentLanguages": [lang_code],
-                                "speakerId": selected_speaker_id,
-                                "transcriptionData": {"content": transcription}
-                            }
-                            st.session_state.segments.append(new_segment)
-                            st.session_state.transcription_content = ""
-                            st.success(f"Segment ({primary_type}) added successfully!")
-                            st.rerun()
-                    except ValueError:
-                        st.error("Please enter valid numeric values for start and end times")
+                            st.session_state.segments.append({"start": start_float,"end": end_float,"segmentId": str(uuid.uuid4()),"primaryType": primary_type,"loudnessLevel": loudness_level,"language": lang_code,"segmentLanguages": [lang_code],"speakerId": selected_speaker_id,"transcriptionData": {"content": transcription}})
+                            st.session_state.transcription_content = ""; st.success("Segment added!"); st.rerun()
+                    except ValueError: st.error("Invalid start/end times.")
+                else: st.error("Cannot add segment without a speaker.")
 
     if st.session_state.segments:
         st.subheader("Annotated Segments")
-        st.markdown("You can delete segments here. For detailed edits, use the JSON editor below.")
-        
-        sorted_segments = sorted(st.session_state.segments, key=lambda x: float(x.get('start', 0)))
-        st.session_state.segments = sorted_segments
-
+        st.session_state.segments = sorted(st.session_state.segments, key=lambda x: x.get('start', 0))
         for i, seg in enumerate(st.session_state.segments):
-            with st.expander(f"Segment {i+1}: {seg['start']} - {seg['end']} ({seg['primaryType']})"):
+            with st.expander(f"Segment {i+1}: {seg['start']}s - {seg['end']}s ({seg['primaryType']})"):
                 st.json(seg)
-                if st.button("Delete Segment", key=f"del_{seg['segmentId']}"):
-                    st.session_state.segments = [
-                        s for s in st.session_state.segments if s['segmentId'] != seg['segmentId']
-                    ]
-                    st.rerun()
+                if st.button("Delete Segment", key=f"del_{seg['segmentId']}"): st.session_state.segments = [s for s in st.session_state.segments if s['segmentId'] != seg['segmentId']]; st.rerun()
 
     if st.session_state.metadata and st.session_state.speakers:
-        final_json = {
-            "type": st.session_state.metadata['type'],
-            "value": {
-                "languages": [st.session_state.metadata['internalLanguageCode']],
-                "languageInfo": st.session_state.metadata['languageInfo'],
-                "domainInfo": st.session_state.metadata['domainInfo'],
-                "conventionInfo": st.session_state.metadata['conventionInfo'],
-                "annotatorInfo": st.session_state.metadata['annotatorInfo'],
-                "speakers": st.session_state.speakers,
-                "segments": st.session_state.segments,
-                "taskStatus": {"segmentation": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"}, "speakerId": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"}, "transcription": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"}}
-            }
-        }
-        st.subheader("Live JSON Editor")
-        st.markdown("You can directly edit, update, or delete values in the JSON below. Click 'Apply Changes' to save them to the application state.")
-        json_string = json.dumps(final_json, indent=4)
-        edited_json_string = st.text_area(label="JSON Data", value=json_string, height=600, key="json_editor")
-        
-        apply_button = st.button("Apply JSON Changes")
-        if apply_button:
+        final_json = {"type": st.session_state.metadata['type'],"value": {"languages": [st.session_state.metadata['internalLanguageCode']],**st.session_state.metadata,"speakers": st.session_state.speakers,"segments": st.session_state.segments,"taskStatus": {"segmentation": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"},"speakerId": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"},"transcription": {"workflowStatus": "COMPLETE", "workflowType": "LABEL"}}}}
+        st.subheader("Live JSON Editor"); edited_json_string = st.text_area("JSON Data", json.dumps(final_json, indent=4), height=600, key="json_editor")
+        if st.button("Apply JSON Changes"):
             try:
-                edited_data = json.loads(edited_json_string)
-                value_section = edited_data.get('value', {})
-                st.session_state.speakers = value_section.get('speakers', [])
-                st.session_state.segments = value_section.get('segments', [])
-                st.success("JSON changes have been applied!")
-                st.rerun()
-            except json.JSONDecodeError as e:
-                st.error(f"Invalid JSON format: {e}")
-
-        st.subheader("Download Final Annotation")
-        st.markdown(get_json_download_link(final_json, filename="annotated_data.json"), unsafe_allow_html=True)
+                edited_data = json.loads(edited_json_string); value_section = edited_data.get('value', {}); st.session_state.speakers = value_section.get('speakers', []); st.session_state.segments = value_section.get('segments', []); st.success("JSON changes applied!"); st.rerun()
+            except json.JSONDecodeError as e: st.error(f"Invalid JSON format: {e}")
+        st.subheader("Download Final Annotation"); st.markdown(get_json_download_link(final_json, "annotated_data.json"), unsafe_allow_html=True)
 
 # =====================================================================================
-# MAIN APP ROUTER (Unchanged)
+# MAIN APP ROUTER
 # =====================================================================================
-
 if st.session_state.page_state == 'metadata_input':
     metadata_form()
 elif st.session_state.page_state == 'annotation':
